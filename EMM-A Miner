@@ -218,6 +218,18 @@ void RemoteCommand (string command)
         return;
 
     string trimmed = command.Trim();
+    if (trimmed.StartsWith("GPS:", StringComparison.OrdinalIgnoreCase) && trimmed.IndexOf(",GPS:", StringComparison.OrdinalIgnoreCase) > 0)
+    {
+        if (TryParsePlaneDefinition(trimmed))
+        {
+            hasPlaneDefinition = true;
+            GenerateAnchorPlan();
+        }
+        else
+            Echo("Invalid plane GPS command. Use <gps>,<gps>,<gps>.");
+        return;
+    }
+
     if (trimmed.StartsWith("GPS:", StringComparison.OrdinalIgnoreCase))
     {
         if (!TryParseGpsCommand(trimmed, out targetPosition, out desiredForward, out desiredUp))
@@ -299,18 +311,6 @@ void RemoteCommand (string command)
         }
         else
             Echo("Invalid SET_OV value.");
-        return;
-    }
-
-    if (trimmed.StartsWith("GPS:", StringComparison.OrdinalIgnoreCase) && trimmed.IndexOf(",GPS:", StringComparison.OrdinalIgnoreCase) > 0)
-    {
-        if (TryParsePlaneDefinition(trimmed))
-        {
-            hasPlaneDefinition = true;
-            GenerateAnchorPlan();
-        }
-        else
-            Echo("Invalid plane GPS command. Use <gps>,<gps>,<gps>.");
         return;
     }
 
@@ -549,8 +549,15 @@ void GenerateAnchorPlan()
 {
     plannedAnchors.Clear();
 
-    Vector3D gravity = rc.GetNaturalGravity();
-    Vector3D worldUp = gravity.LengthSquared() > 0.001 ? Vector3D.Normalize(-gravity) : rc.WorldMatrix.Up;
+    Vector3D center = (cornerA + cornerB) * 0.5;
+    Vector3D sideVector = startSideGps - center;
+    if (sideVector.LengthSquared() < 0.0001)
+    {
+        Echo("StartSide GPS must be away from plane center.");
+        return;
+    }
+
+    Vector3D planeNormalTowardStart = Vector3D.Normalize(sideVector);
     Vector3D diagonal = cornerB - cornerA;
     if (diagonal.LengthSquared() < 0.0001)
     {
@@ -558,25 +565,65 @@ void GenerateAnchorPlan()
         return;
     }
 
-    double downDistance = Vector3D.Dot(diagonal, -worldUp);
-    Vector3D rightPart = diagonal - Vector3D.Dot(diagonal, worldUp) * worldUp;
-    if (rightPart.LengthSquared() < 0.0001 || Math.Abs(downDistance) < 0.0001)
+    // "Up" comes from the corner semantic (CornerA = upper-left, CornerB = lower-right),
+    // using world +Y as the global reference axis (not gravity/ship orientation).
+    Vector3D worldUp = new Vector3D(0, 1, 0);
+    Vector3D upRefProjected = worldUp - Vector3D.Dot(worldUp, planeNormalTowardStart) * planeNormalTowardStart;
+    if (upRefProjected.LengthSquared() < 0.0001)
     {
-        Echo("Corners do not define a valid upper-left to lower-right plane.");
+        Vector3D worldForward = new Vector3D(0, 0, -1);
+        upRefProjected = worldForward - Vector3D.Dot(worldForward, planeNormalTowardStart) * planeNormalTowardStart;
+    }
+    if (upRefProjected.LengthSquared() < 0.0001)
+    {
+        Echo("Could not infer plane up direction from corners.");
         return;
     }
 
-    planRight = Vector3D.Normalize(rightPart);
-    planUp = worldUp;
-    planWidth = rightPart.Length();
-    planHeight = Math.Abs(downDistance);
+    planUp = Vector3D.Normalize(upRefProjected);
+    planRight = Vector3D.Normalize(Vector3D.Cross(planUp, planeNormalTowardStart));
+    if (planRight.LengthSquared() < 0.0001)
+    {
+        Echo("Could not infer plane right direction from corners.");
+        return;
+    }
 
-    Vector3D planNormal = Vector3D.Normalize(Vector3D.Cross(planRight, planUp));
-    Vector3D center = cornerA + (planRight * (planWidth * 0.5)) - (planUp * (planHeight * 0.5));
-    Vector3D sideDir = startSideGps - center;
-    if (sideDir.LengthSquared() > 0.001 && Vector3D.Dot(planNormal, sideDir) > 0)
-        planNormal = -planNormal;
-    planForward = planNormal;
+    if (Vector3D.Dot(diagonal, planRight) < 0)
+        planRight = -planRight;
+    if (Vector3D.Dot(diagonal, planUp) > 0)
+        planUp = -planUp;
+
+    // Rebuild right to keep a stable orthonormal basis after sign corrections.
+    planRight = Vector3D.Normalize(Vector3D.Cross(planUp, planeNormalTowardStart));
+    if (planUp.LengthSquared() < 0.0001)
+    {
+        Echo("Unable to infer plane up vector.");
+        return;
+    }
+
+    double rightDistance = Vector3D.Dot(diagonal, planRight);
+    double upDistance = Vector3D.Dot(diagonal, planUp);
+    if (rightDistance < 0)
+    {
+        planRight = -planRight;
+        rightDistance = -rightDistance;
+    }
+    if (upDistance > 0)
+    {
+        planUp = -planUp;
+        upDistance = -upDistance;
+    }
+
+    planWidth = Math.Abs(rightDistance);
+    planHeight = Math.Abs(upDistance);
+    if (planWidth < 0.0001 || planHeight < 0.0001)
+    {
+        Echo("Plane width/height are too small.");
+        return;
+    }
+
+    // Mine from the chosen side into the plane.
+    planForward = -planeNormalTowardStart;
 
     double stepX = minerWidthMeters - overlapMeters;
     double stepY = minerHeightMeters - overlapMeters;

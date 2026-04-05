@@ -17,6 +17,11 @@
 // cancelmine : stops mining state machine and turns drills off
 // SPEEDF <value> : sets forward drilling speed (m/s)
 // SPEEDB <value> : sets backing-out speed (m/s)
+// <gps>,<gps>,<gps> : sets CornerA, CornerB, StartSide and generates anchor plan
+// SET_MW <meters> : sets miner width used for anchor spacing
+// SET_MH <meters> : sets miner height used for anchor spacing
+// SET_OV <meters> : sets overlap used in anchor spacing
+// mineplane;depth : mines all planned anchors using one lane per anchor
 // =====================================
 
 Settings settings;
@@ -46,6 +51,23 @@ double laneDepth = 0;
 double SPEEDF = 1.0; // forward drilling speed (m/s)
 double SPEEDB = 6.0; // backing-out speed (m/s)
 double activeMaxSpeed = 0;
+double minerWidthMeters = 2.5;
+double minerHeightMeters = 2.5;
+double overlapMeters = 0.2;
+
+Vector3D cornerA = Vector3D.Zero;
+Vector3D cornerB = Vector3D.Zero;
+Vector3D startSideGps = Vector3D.Zero;
+bool hasPlaneDefinition = false;
+Vector3D planRight = Vector3D.Zero;
+Vector3D planUp = Vector3D.Zero;
+Vector3D planForward = Vector3D.Zero;
+double planWidth = 0;
+double planHeight = 0;
+readonly List<Vector3D> plannedAnchors = new List<Vector3D>();
+bool planeMiningEnabled = false;
+int planeAnchorIndex = 0;
+double planeMineDepth = 0;
 
 readonly int echoFrequency = 100; // every 100th game tick
 int runtime = 0;
@@ -122,6 +144,10 @@ void WriteEcho()
     sb.AppendLine($"Mining: {miningState}");
     sb.AppendLine($"SPEEDF: {SPEEDF:0.00} m/s");
     sb.AppendLine($"SPEEDB: {SPEEDB:0.00} m/s");
+    sb.AppendLine($"Miner W/H: {minerWidthMeters:0.00}/{minerHeightMeters:0.00} m");
+    sb.AppendLine($"Overlap: {overlapMeters:0.00} m");
+    sb.AppendLine($"Anchors: {plannedAnchors.Count}");
+    sb.AppendLine($"Plane mining: {(planeMiningEnabled ? $"ON ({planeAnchorIndex + 1}/{Math.Max(1, plannedAnchors.Count)})" : "OFF")}");
     sb.AppendLine("Faceforward = look toward target");
     sb.AppendLine("Faceup = align up to gravity-up (or current up in space)");
 
@@ -192,6 +218,18 @@ void RemoteCommand (string command)
         return;
 
     string trimmed = command.Trim();
+    if (trimmed.StartsWith("GPS:", StringComparison.OrdinalIgnoreCase) && trimmed.IndexOf(",GPS:", StringComparison.OrdinalIgnoreCase) > 0)
+    {
+        if (TryParsePlaneDefinition(trimmed))
+        {
+            hasPlaneDefinition = true;
+            GenerateAnchorPlan();
+        }
+        else
+            Echo("Invalid plane GPS command. Use <gps>,<gps>,<gps>.");
+        return;
+    }
+
     if (trimmed.StartsWith("GPS:", StringComparison.OrdinalIgnoreCase))
     {
         if (!TryParseGpsCommand(trimmed, out targetPosition, out desiredForward, out desiredUp))
@@ -231,6 +269,51 @@ void RemoteCommand (string command)
         return;
     }
 
+    if (trimmed.StartsWith("SET_MW ", StringComparison.OrdinalIgnoreCase))
+    {
+        double v;
+        if (double.TryParse(trimmed.Substring(7).Trim(), out v) && v > 0)
+        {
+            minerWidthMeters = v;
+            Echo($"Miner width set to {minerWidthMeters:0.00} m");
+            if (hasPlaneDefinition)
+                GenerateAnchorPlan();
+        }
+        else
+            Echo("Invalid SET_MW value.");
+        return;
+    }
+
+    if (trimmed.StartsWith("SET_MH ", StringComparison.OrdinalIgnoreCase))
+    {
+        double v;
+        if (double.TryParse(trimmed.Substring(7).Trim(), out v) && v > 0)
+        {
+            minerHeightMeters = v;
+            Echo($"Miner height set to {minerHeightMeters:0.00} m");
+            if (hasPlaneDefinition)
+                GenerateAnchorPlan();
+        }
+        else
+            Echo("Invalid SET_MH value.");
+        return;
+    }
+
+    if (trimmed.StartsWith("SET_OV ", StringComparison.OrdinalIgnoreCase))
+    {
+        double v;
+        if (double.TryParse(trimmed.Substring(7).Trim(), out v) && v >= 0)
+        {
+            overlapMeters = v;
+            Echo($"Overlap set to {overlapMeters:0.00} m");
+            if (hasPlaneDefinition)
+                GenerateAnchorPlan();
+        }
+        else
+            Echo("Invalid SET_OV value.");
+        return;
+    }
+
     switch (trimmed.ToLower())
     {
         case "stop":
@@ -260,6 +343,7 @@ void RemoteCommand (string command)
             break;
         case "cancelmine":
             miningEnabled = false;
+            planeMiningEnabled = false;
             miningState = MiningState.Idle;
             activeMaxSpeed = 0;
             SetDrills(false);
@@ -268,6 +352,8 @@ void RemoteCommand (string command)
         default:
             if (trimmed.StartsWith("minelane;", StringComparison.OrdinalIgnoreCase))
                 StartSingleLaneMining(trimmed);
+            else if (trimmed.StartsWith("mineplane;", StringComparison.OrdinalIgnoreCase))
+                StartPlaneMining(trimmed);
             break;
     }
 }
@@ -312,6 +398,51 @@ void StartSingleLaneMining(string command)
     Echo($"Mining lane started. Depth={laneDepth:0.00}m");
 }
 
+void StartPlaneMining(string command)
+{
+    if (!hasPlaneDefinition || plannedAnchors.Count == 0)
+    {
+        Echo("No plane anchors planned. Send <gps>,<gps>,<gps> first.");
+        return;
+    }
+
+    string[] args = command.Split(';');
+    if (args.Length < 2)
+    {
+        Echo("Usage: mineplane;depth");
+        return;
+    }
+
+    double depth;
+    if (!double.TryParse(args[1], out depth) || depth <= 0)
+    {
+        Echo("Invalid depth.");
+        return;
+    }
+
+    planeMineDepth = depth;
+    planeAnchorIndex = 0;
+    planeMiningEnabled = true;
+    StartLaneAtAnchor(plannedAnchors[planeAnchorIndex], planeMineDepth);
+    Echo($"Plane mining started. Anchors={plannedAnchors.Count}, Depth={planeMineDepth:0.00}m");
+}
+
+void StartLaneAtAnchor(Vector3D anchor, double depth)
+{
+    laneDepth = depth;
+    laneAnchor = anchor;
+    drillAxis = planForward;
+
+    desiredForward = drillAxis;
+    desiredUp = planUp;
+    targetPosition = laneAnchor;
+    activeMaxSpeed = SPEEDB;
+    hasTarget = true;
+    autopilotEnabled = true;
+    miningEnabled = true;
+    miningState = MiningState.EnterLane;
+}
+
 void UpdateMiningState()
 {
     switch (miningState)
@@ -340,14 +471,193 @@ void UpdateMiningState()
             if (IsAtTargetPosition(targetPosition))
             {
                 SetDrills(false);
-                miningEnabled = false;
-                miningState = MiningState.Idle;
-                autopilotEnabled = false;
-                activeMaxSpeed = 0;
-                Echo("Mining lane complete.");
+                if (planeMiningEnabled)
+                {
+                    planeAnchorIndex++;
+                    if (planeAnchorIndex < plannedAnchors.Count)
+                    {
+                        StartLaneAtAnchor(plannedAnchors[planeAnchorIndex], planeMineDepth);
+                        Echo($"Advancing to anchor {planeAnchorIndex + 1}/{plannedAnchors.Count}");
+                    }
+                    else
+                    {
+                        planeMiningEnabled = false;
+                        miningEnabled = false;
+                        miningState = MiningState.Idle;
+                        autopilotEnabled = false;
+                        activeMaxSpeed = 0;
+                        Echo("Plane mining complete.");
+                    }
+                }
+                else
+                {
+                    miningEnabled = false;
+                    miningState = MiningState.Idle;
+                    autopilotEnabled = false;
+                    activeMaxSpeed = 0;
+                    Echo("Mining lane complete.");
+                }
             }
             break;
     }
+}
+
+bool TryParsePlaneDefinition(string command)
+{
+    string[] gpsParts = command.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+    if (gpsParts.Length != 3)
+        return false;
+
+    Vector3D a, b, s;
+    if (!TryParseGpsPosition(gpsParts[0].Trim(), out a))
+        return false;
+    if (!TryParseGpsPosition(gpsParts[1].Trim(), out b))
+        return false;
+    if (!TryParseGpsPosition(gpsParts[2].Trim(), out s))
+        return false;
+
+    cornerA = a;
+    cornerB = b;
+    startSideGps = s;
+    return true;
+}
+
+bool TryParseGpsPosition(string gpsCommand, out Vector3D gps)
+{
+    gps = Vector3D.Zero;
+    if (!gpsCommand.StartsWith("GPS:", StringComparison.OrdinalIgnoreCase))
+        return false;
+
+    string[] parts = gpsCommand.Split('|');
+    string[] tokens = parts[0].Split(':');
+    if (tokens.Length < 5)
+        return false;
+
+    double x, y, z;
+    if (!double.TryParse(tokens[2], out x))
+        return false;
+    if (!double.TryParse(tokens[3], out y))
+        return false;
+    if (!double.TryParse(tokens[4], out z))
+        return false;
+
+    gps = new Vector3D(x, y, z);
+    return true;
+}
+
+void GenerateAnchorPlan()
+{
+    plannedAnchors.Clear();
+
+    Vector3D center = (cornerA + cornerB) * 0.5;
+    Vector3D sideVector = startSideGps - center;
+    if (sideVector.LengthSquared() < 0.0001)
+    {
+        Echo("StartSide GPS must be away from plane center.");
+        return;
+    }
+
+    Vector3D planeNormalTowardStart = Vector3D.Normalize(sideVector);
+    Vector3D diagonal = cornerB - cornerA;
+    if (diagonal.LengthSquared() < 0.0001)
+    {
+        Echo("CornerA and CornerB are too close.");
+        return;
+    }
+
+    Vector3D rightPart = diagonal - Vector3D.Dot(diagonal, planeNormalTowardStart) * planeNormalTowardStart;
+    if (rightPart.LengthSquared() < 0.0001)
+    {
+        Echo("Corners/start side do not define a valid plane.");
+        return;
+    }
+
+    planRight = Vector3D.Normalize(rightPart);
+    planUp = Vector3D.Normalize(Vector3D.Cross(planRight, planeNormalTowardStart));
+    if (planUp.LengthSquared() < 0.0001)
+    {
+        Echo("Unable to infer plane up vector.");
+        return;
+    }
+
+    double rightDistance = Vector3D.Dot(diagonal, planRight);
+    double upDistance = Vector3D.Dot(diagonal, planUp);
+    if (rightDistance < 0)
+    {
+        planRight = -planRight;
+        rightDistance = -rightDistance;
+    }
+    if (upDistance > 0)
+    {
+        planUp = -planUp;
+        upDistance = -upDistance;
+    }
+
+    planWidth = Math.Abs(rightDistance);
+    planHeight = Math.Abs(upDistance);
+    if (planWidth < 0.0001 || planHeight < 0.0001)
+    {
+        Echo("Plane width/height are too small.");
+        return;
+    }
+
+    // Mine from the chosen side into the plane.
+    planForward = -planeNormalTowardStart;
+
+    double stepX = minerWidthMeters - overlapMeters;
+    double stepY = minerHeightMeters - overlapMeters;
+    if (stepX <= 0 || stepY <= 0)
+    {
+        Echo("Invalid spacing: miner size must be greater than overlap.");
+        return;
+    }
+
+    List<double> xs = BuildAxisSamples(planWidth, stepX);
+    List<double> ys = BuildAxisSamples(planHeight, stepY);
+
+    for (int row = 0; row < ys.Count; row++)
+    {
+        bool reverse = (row % 2) == 1;
+        for (int col = 0; col < xs.Count; col++)
+        {
+            int xIndex = reverse ? xs.Count - 1 - col : col;
+            Vector3D anchor = cornerA + (planRight * xs[xIndex]) - (planUp * ys[row]);
+            plannedAnchors.Add(anchor);
+        }
+    }
+
+    if (plannedAnchors.Count > 0)
+    {
+        targetPosition = plannedAnchors[0];
+        desiredForward = planForward;
+        desiredUp = planUp;
+        hasTarget = true;
+    }
+
+    Echo($"Plane anchors generated: {plannedAnchors.Count} ({xs.Count}x{ys.Count})");
+}
+
+List<double> BuildAxisSamples(double dimension, double step)
+{
+    List<double> values = new List<double>();
+    values.Add(0);
+    if (dimension <= 0)
+        return values;
+
+    double cursor = 0;
+    int guard = 0;
+    while (cursor + 0.001 < dimension && guard < 100000)
+    {
+        double next = cursor + step;
+        if (next >= dimension)
+            next = dimension;
+        if (next - cursor < 0.0001)
+            break;
+        values.Add(next);
+        cursor = next;
+        guard++;
+    }
+    return values;
 }
 
 bool IsAtTargetPosition(Vector3D target)

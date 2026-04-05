@@ -14,6 +14,7 @@
 // clear : clears target and releases controls
 // dumpgps : appends current GPS + orientation snapshot to Custom Data
 // minelane;depth : run one mining lane from anchor to depth and return
+// mineplane;GPS_UL;GPS_BR;depth;spacing;overlap : snake anchors across a plane and mine each lane
 // cancelmine : stops mining state machine and turns drills off
 // SPEEDF <value> : sets forward drilling speed (m/s)
 // SPEEDB <value> : sets backing-out speed (m/s)
@@ -46,6 +47,11 @@ double laneDepth = 0;
 double SPEEDF = 1.0; // forward drilling speed (m/s)
 double SPEEDB = 6.0; // backing-out speed (m/s)
 double activeMaxSpeed = 0;
+bool planeMiningEnabled = false;
+List<Vector3D> planeAnchors = new List<Vector3D>();
+int planeAnchorIndex = 0;
+Vector3D planeForward = Vector3D.Zero;
+Vector3D planeUp = Vector3D.Zero;
 
 readonly int echoFrequency = 100; // every 100th game tick
 int runtime = 0;
@@ -117,6 +123,7 @@ void WriteEcho()
     sb.AppendLine("Command example:");
     sb.AppendLine("GPS:Site:66288.47:-8270.96:-94039.68:|-0.4942,-0.5045,0.7079,0.5018,0.4994,0.7063");
     sb.AppendLine("dumpgps");
+    sb.AppendLine("mineplane;GPS_UL;GPS_BR;depth;spacing;overlap");
     sb.AppendLine($"Arrival tolerance: {settings.arrivalTolerance.Value:0.00} m");
     sb.AppendLine($"Orientation tolerance: {settings.orientationToleranceDeg.Value:0.00} deg");
     sb.AppendLine($"Mining: {miningState}");
@@ -249,6 +256,9 @@ void RemoteCommand (string command)
             desiredForward = Vector3D.Zero;
             desiredUp = Vector3D.Zero;
             miningEnabled = false;
+            planeMiningEnabled = false;
+            planeAnchors.Clear();
+            planeAnchorIndex = 0;
             miningState = MiningState.Idle;
             activeMaxSpeed = 0;
             SetDrills(false);
@@ -260,6 +270,9 @@ void RemoteCommand (string command)
             break;
         case "cancelmine":
             miningEnabled = false;
+            planeMiningEnabled = false;
+            planeAnchors.Clear();
+            planeAnchorIndex = 0;
             miningState = MiningState.Idle;
             activeMaxSpeed = 0;
             SetDrills(false);
@@ -268,6 +281,8 @@ void RemoteCommand (string command)
         default:
             if (trimmed.StartsWith("minelane;", StringComparison.OrdinalIgnoreCase))
                 StartSingleLaneMining(trimmed);
+            else if (trimmed.StartsWith("mineplane;", StringComparison.OrdinalIgnoreCase))
+                StartPlaneMining(trimmed);
             break;
     }
 }
@@ -302,6 +317,130 @@ void StartSingleLaneMining(string command)
         desiredUp = gravity.LengthSquared() > 0.001 ? Vector3D.Normalize(-gravity) : rc.WorldMatrix.Up;
     }
 
+    planeMiningEnabled = false;
+    planeAnchors.Clear();
+    planeAnchorIndex = 0;
+    BeginMiningLane(laneAnchor, laneDepth, drillAxis, desiredUp);
+    Echo($"Mining lane started. Depth={laneDepth:0.00}m");
+}
+
+void StartPlaneMining(string command)
+{
+    string[] args = command.Split(';');
+    if (args.Length < 6)
+    {
+        Echo("Usage: mineplane;GPS_UL;GPS_BR;depth;spacing;overlap");
+        return;
+    }
+
+    Vector3D ulPos, ulForward, ulUp;
+    Vector3D brPos, brForward, brUp;
+    if (!TryParseGpsCommand(args[1].Trim(), out ulPos, out ulForward, out ulUp))
+    {
+        Echo("Invalid upper-left GPS.");
+        return;
+    }
+    if (!TryParseGpsCommand(args[2].Trim(), out brPos, out brForward, out brUp))
+    {
+        Echo("Invalid bottom-right GPS.");
+        return;
+    }
+
+    double depth;
+    double spacing;
+    double overlap;
+    if (!double.TryParse(args[3], out depth) || depth <= 0)
+    {
+        Echo("Invalid depth.");
+        return;
+    }
+    if (!double.TryParse(args[4], out spacing) || spacing <= 0)
+    {
+        Echo("Invalid spacing.");
+        return;
+    }
+    if (!double.TryParse(args[5], out overlap) || overlap < 0 || overlap >= spacing)
+    {
+        Echo("Invalid overlap. Must be >= 0 and < spacing.");
+        return;
+    }
+
+    planeForward = ulForward.LengthSquared() > 0.001 ? ulForward : (brForward.LengthSquared() > 0.001 ? brForward : desiredForward);
+    if (planeForward.LengthSquared() < 0.001)
+        planeForward = rc.WorldMatrix.Forward;
+    planeForward = Vector3D.Normalize(planeForward);
+
+    planeUp = ulUp.LengthSquared() > 0.001 ? ulUp : (brUp.LengthSquared() > 0.001 ? brUp : desiredUp);
+    if (planeUp.LengthSquared() < 0.001)
+    {
+        Vector3D gravity = rc.GetNaturalGravity();
+        planeUp = gravity.LengthSquared() > 0.001 ? Vector3D.Normalize(-gravity) : rc.WorldMatrix.Up;
+    }
+    else
+        planeUp = Vector3D.Normalize(planeUp);
+
+    Vector3D right = Vector3D.Cross(planeForward, planeUp);
+    if (right.LengthSquared() < 0.001)
+    {
+        Echo("Invalid orientation: forward parallel to up.");
+        return;
+    }
+    right = Vector3D.Normalize(right);
+    Vector3D down = -planeUp;
+
+    Vector3D delta = brPos - ulPos;
+    double width = Vector3D.Dot(delta, right);
+    double height = Vector3D.Dot(delta, down);
+    if (width <= 0.1 || height <= 0.1)
+    {
+        Echo("Plane corners/orientation do not form positive width/height.");
+        return;
+    }
+
+    double stepDown = Math.Max(0.1, spacing - overlap);
+
+    planeAnchors.Clear();
+    bool leftToRight = true;
+    for (double y = 0; y <= height + 0.01; y += stepDown)
+    {
+        double rowY = Math.Min(height, y);
+        if (leftToRight)
+        {
+            for (double x = 0; x <= width + 0.01; x += spacing)
+            {
+                double rowX = Math.Min(width, x);
+                planeAnchors.Add(ulPos + right * rowX + down * rowY);
+            }
+        }
+        else
+        {
+            for (double x = width; x >= -0.01; x -= spacing)
+            {
+                double rowX = Math.Max(0, x);
+                planeAnchors.Add(ulPos + right * rowX + down * rowY);
+            }
+        }
+        leftToRight = !leftToRight;
+    }
+
+    if (planeAnchors.Count == 0)
+    {
+        Echo("No anchors generated.");
+        return;
+    }
+
+    planeAnchorIndex = 0;
+    planeMiningEnabled = true;
+    BeginMiningLane(planeAnchors[planeAnchorIndex], depth, planeForward, planeUp);
+    Echo($"Plane mining started. Anchors={planeAnchors.Count}, depth={depth:0.00}m");
+}
+
+void BeginMiningLane(Vector3D anchor, double depth, Vector3D forward, Vector3D up)
+{
+    laneDepth = depth;
+    laneAnchor = anchor;
+    drillAxis = Vector3D.Normalize(forward);
+    desiredUp = Vector3D.Normalize(up);
     desiredForward = drillAxis;
     targetPosition = laneAnchor;
     activeMaxSpeed = SPEEDB;
@@ -309,7 +448,6 @@ void StartSingleLaneMining(string command)
     autopilotEnabled = true;
     miningEnabled = true;
     miningState = MiningState.EnterLane;
-    Echo($"Mining lane started. Depth={laneDepth:0.00}m");
 }
 
 void UpdateMiningState()
@@ -340,11 +478,28 @@ void UpdateMiningState()
             if (IsAtTargetPosition(targetPosition))
             {
                 SetDrills(false);
-                miningEnabled = false;
-                miningState = MiningState.Idle;
-                autopilotEnabled = false;
-                activeMaxSpeed = 0;
-                Echo("Mining lane complete.");
+                if (planeMiningEnabled && planeAnchorIndex + 1 < planeAnchors.Count)
+                {
+                    planeAnchorIndex++;
+                    BeginMiningLane(planeAnchors[planeAnchorIndex], laneDepth, planeForward, planeUp);
+                    Echo($"Plane lane {planeAnchorIndex + 1}/{planeAnchors.Count}");
+                }
+                else
+                {
+                    miningEnabled = false;
+                    miningState = MiningState.Idle;
+                    autopilotEnabled = false;
+                    activeMaxSpeed = 0;
+                    if (planeMiningEnabled)
+                    {
+                        planeMiningEnabled = false;
+                        planeAnchors.Clear();
+                        planeAnchorIndex = 0;
+                        Echo("Plane mining complete.");
+                    }
+                    else
+                        Echo("Mining lane complete.");
+                }
             }
             break;
     }
